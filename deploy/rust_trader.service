@@ -1,0 +1,19 @@
+[Unit]
+Description=Rocket v2 - Rust trading engine (Binance Futures)
+After=network-online.target redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__RUN_USER__
+WorkingDirectory=__APP_DIR__
+ExecStart=__APP_DIR__/engine_rust/target/release/rust_trader
+Restart=always
+RestartSec=3
+Nice=-10
+LimitNOFILE=1048576
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

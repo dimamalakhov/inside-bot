@@ -1,0 +1,19 @@
+# локальные артефакты сборки
+.toolchain/
+engine_rust/target/
+.acl-recovery/
+
+# python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# логи и сессии
+logs/
+*.session
+*.session-journal
+
+# прочее
+.env
+config/api_keys.json

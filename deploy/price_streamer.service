@@ -1,0 +1,15 @@
+[Unit]
+Description=Rocket v2 - price streamer (Binance WebSockets -> Redis)
+After=network-online.target redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__RUN_USER__
+WorkingDirectory=__APP_DIR__
+ExecStart=__APP_DIR__/venv/bin/python3 __APP_DIR__/price_streamer.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,18 @@
+{
+  "founders": [
+    {
+      "owner": "founder_1",
+      "public": "PUBLIC_API_KEY_HERE",
+      "private": "SECRET_API_KEY_HERE"
+    }
+  ],
+  "friends": [],
+  "clients": [],
+  "support": [
+    {
+      "owner": "support_1",
+      "public": "PUBLIC_API_KEY_HERE",
+      "private": "SECRET_API_KEY_HERE"
+    }
+  ]
+}
