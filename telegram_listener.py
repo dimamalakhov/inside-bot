@@ -2,6 +2,7 @@ import os
 import asyncio
 import contextlib
 import logging
+import socket
 # from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -50,6 +51,29 @@ REDIS_HOST = _require_env("REDIS_HOST")
 REDIS_PORT = int(_require_env("REDIS_PORT"))
 REDIS_QUEUE = _require_env("REDIS_QUEUE")
 REDIS_RECONNECT_SEC = 5  # Back-off between reconnect attempts
+
+# --- UDP bridge (Европа -> Токио) ---------------------------------------------
+# Если BRIDGE_HOST задан, каждый сигнал дополнительно уходит в Токио по UDP.
+# Полезная нагрузка — тот же текст сообщения, что и в Redis: движок разбирает
+# оба формата (`#BTC Bullish` и JSON).
+BRIDGE_HOST = os.getenv("BRIDGE_HOST")
+BRIDGE_PORT = int(os.getenv("BRIDGE_PORT", "5005"))
+BRIDGE_ADDR = (BRIDGE_HOST, BRIDGE_PORT) if BRIDGE_HOST else None
+_bridge_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if BRIDGE_ADDR else None
+
+
+def forward_to_bridge(payload: str) -> None:
+    """Fire-and-forget дублирование сигнала в Токио (3 копии, как bridge_client.py)."""
+    if _bridge_socket is None:
+        return
+    data = payload.encode("utf-8", "replace")
+    for _ in range(3):
+        try:
+            _bridge_socket.sendto(data, BRIDGE_ADDR)
+        except OSError as exc:
+            health_logger.debug("UDP bridge send failed: %s", exc)
+            break
+
 
 # Non-blocking logger
 from utils.logger import setup_logger
@@ -105,7 +129,10 @@ async def fast_handler(client: Client, message):
 
     msg_logger.info("TG: %s | %s → %s", message.date.isoformat(), client.name, message_content)
 
-    # Redis: downstream automation
+    # 1) UDP-мост в Токио (если настроен) — не зависит от локального Redis
+    forward_to_bridge(message_content)
+
+    # 2) Redis: downstream automation
     if redis_client is None:
         return  # Redis not ready; skip silently (already logged)
 

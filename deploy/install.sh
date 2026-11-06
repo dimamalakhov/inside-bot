@@ -61,7 +61,7 @@ fi
 
 # ---- 5. systemd units ----------------------------------------------------
 log "Installing systemd units (run user: $RUN_USER)..."
-for unit in rust_trader price_streamer balance_streamer; do
+for unit in rust_trader price_streamer balance_streamer reset_account_config; do
     sed \
         -e "s|__APP_DIR__|$APP_DIR|g" \
         -e "s|__RUN_USER__|$RUN_USER|g" \
@@ -71,7 +71,7 @@ done
 
 systemctl daemon-reload
 systemctl enable --now redis-server
-systemctl enable rust_trader price_streamer balance_streamer
+systemctl enable rust_trader price_streamer balance_streamer reset_account_config
 
 # ---- 6. ownership (если юниты работают не от root) ----------------------
 if [[ "$RUN_USER" != "root" ]]; then
@@ -86,7 +86,9 @@ cat <<'EOF'
 
   1. config/api_keys.json  — ключи аккаунтов (founders/friends/clients)
   2. .env                  — cp deploy/.env.example .env  (TRADE_DRY_RUN=true для первого старта)
-  3. systemctl start price_streamer balance_streamer rust_trader
+  3. systemctl start price_streamer balance_streamer
+     sleep 15
+     systemctl start reset_account_config rust_trader
 
 Проверка:
   systemctl status rust_trader

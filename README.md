@@ -1,6 +1,7 @@
 # 🚀 Rocket v2: HFT News Trading Bot
 
-Высокопроизводительный гибридный (Python/Rust) торговый бот для Binance Futures.
+Высокопроизводительный гибридный (Python/Rust) торговый бот для Binance Futures:
+сигналы из Telegram → мгновенное исполнение ордеров по всем аккаунтам + TP/SL.
 
 ## 📂 Структура Проекта
 
@@ -25,15 +26,18 @@
 │       ├── queue.rs           # BLPOP trade_queue с переподключением
 │       ├── selftest.rs        # офлайн-проверка (--selftest)
 │       └── metrics.rs         # счётчики и латентность
-├── deploy/                  # Развёртывание на Ubuntu (systemd + install.sh)
-│   ├── install.sh              # установка пакетов, Rust, сборка, systemd
+├── deploy/                  # Развёртывание на Ubuntu
+│   ├── install.sh              # пакеты, Rust, сборка, venv, systemd (Trading Node)
 │   ├── rust_trader.service     # юнит движка
 │   ├── price_streamer.service  # юнит стримера цен
 │   ├── balance_streamer.service# юнит стримера балансов
+│   ├── reset_account_config.service
+│   ├── telegram_listener.service   # юнит слушателя (Listener Node)
 │   ├── .env.example            # шаблон .env торгового узла
-│   └── README.md               # Ubuntu runbook
+│   ├── .env.listener.example   # шаблон .env узла-слушателя
+│   └── README.md               # детали systemd, обновление, откат
 ├── telegram_listener.py     # Слушатель сигналов Telegram (Pyrogram)
-├── bridge_client.py         # Отправка сигналов по UDP (Европа -> Токио)
+├── bridge_client.py         # Ручная отправка сигнала по UDP (Европа -> Токио)
 ├── price_streamer.py        # Стример цен (WebSockets -> Redis)
 ├── balance_streamer.py      # Монитор балансов (WebSockets -> Redis)
 ├── reset_account_config.py  # Плечо + ISOLATED-режим по аккаунтам (периодически)
@@ -50,82 +54,307 @@
 └── .gitignore
 ```
 
-## 🌍 Архитектура
+## 🌍 Архитектура и топологии
 
-Гео-сплит: **Европа (Listener Node)** рядом с Telegram DC2 и **Токио (Trading Node)** рядом с Binance.
-Используйте раздельные Python-зависимости: `requirements_listener.txt` для слушателя и `requirements_trader.txt` для торгового узла.
+| Топология | Когда | Что дополнительно нужно |
+|---|---|---|
+| **Одна машина** | быстрый старт, тесты, небольшие объёмы | ничего |
+| **Гео-сплит** (Европа + Токио) | продакшн с минимальной задержкой | UDP-мост EU → Tokyo |
 
-### Сервер 1: Европа (Listener Node)
+Гео-сплит:
 
-**Что установить и подготовить:**
-- Базовые пакеты (сначала):
-  ```bash
-  sudo apt update && sudo apt upgrade -y
-  sudo apt install -y build-essential python3-dev
-  sudo apt install -y python3 python3-pip python3-venv python-dotenv
-  sudo apt install -y redis-server
-  ```
-- Python + venv: `python3 -m venv venv && source venv/bin/activate && pip install -r requirements_listener.txt`  
-- Redis локально (для дедупликации сигналов).
-- Файлы: `telegram_listener.py`, `bridge_client.py`, `generate_session.py` (для генерации сессий), `utils/logger.py`, `.env`, `sessions/`.
-
-**Конфигурация `.env`:**
-```ini
-PYROGRAM_API_ID=...
-PYROGRAM_API_HASH=...
-PYROGRAM_TARGET_CHAT=...
-REDIS_HOST=127.0.0.1
-REDIS_PORT=6379
-REDIS_QUEUE=trade_queue
-BRIDGE_HOST=<IP_TOKYO_SERVER>
-BRIDGE_PORT=5005
-```
-
-**Сеть / Firewall:**
-- Outbound: UDP 5005 → IP Токио; TCP 443 → api.telegram.org.
-- Inbound: SSH (22) с вашего IP; остальное закрыто.
-
-### Сервер 2: Токио (Trading Node)
-
-**Что установить и подготовить:**
-- Базовые пакеты (сначала):
-  ```bash
-  sudo apt update && sudo apt upgrade -y
-  sudo apt install -y build-essential python3-dev
-  sudo apt install -y python3 python3-pip python3-venv
-  sudo apt install -y redis-server
-  ```
-- Python + venv: `python3 -m venv venv && source venv/bin/activate && pip install -r requirements_trader.txt`  
-  (отдельный requirements для Trading: бинансовые SDK/WebSocket, asyncio-стек, Redis-клиент и пр.)
-- Rust toolchain и сборка (рекомендуемый путь — `sudo bash deploy/install.sh`, см. `deploy/README.md`):
-  ```bash
-  cd engine_rust
-  cargo build --release --locked   # бинарник: engine_rust/target/release/rust_trader (Linux, без .exe)
-  ./target/release/rust_trader --selftest   # офлайн-проверка сборки, без сети
-  cd ..
-  ```
-- Redis локально.
-- Файлы: `launcher.py`, `engine_python.py` (опционально), `engine_rust/` (собранный), `price_streamer.py`, `balance_streamer.py`, `reset_account_config.py` (плечо/режим маржи), `utils/logger.py`, `config/api_keys.json`, `.env`.
-
-**Конфигурация `.env`:**
-```ini
-# API-ключи аккаунтов — в config/api_keys.json (не в .env)
-REDIS_HOST=127.0.0.1
-REDIS_PORT=6379
-BRIDGE_PORT=5005
-TRADE_DRY_RUN=true          # первый запуск — dry-run, затем false
-# полный список параметров — в deploy/.env.example и разделе ниже
-```
-
-**Сеть / Firewall:**
-- Inbound: UDP 5005 ← IP Европы; SSH (22) с вашего IP.
-- Outbound: TCP 443 → fapi.binance.com; TCP 443 → ws-fapi.binance.com; TCP 9443 → fstream.binance.com.
-
-**Схема работы:**
 ```
 [Telegram DC2] -> [Listener EU] -> [UDP Bridge] -> [Trader Tokyo] -> [Binance]
      ~10ms           ~1ms             ~80ms            ~1ms           ~5ms
 ```
+
+Что где работает:
+
+| Узел | Процессы | Зависимости |
+|---|---|---|
+| Европа | `redis-server`, `telegram_listener` | `requirements_listener.txt` |
+| Токио | `redis-server`, `price_streamer`, `balance_streamer`, `reset_account_config`, `rust_trader` | `requirements_trader.txt` + Rust |
+
+Порты:
+
+| Где | Порт / протокол | Назначение |
+|---|---|---|
+| EU → Tokyo | UDP 5005 | сигналы (мост) |
+| EU | TCP 443 | api.telegram.org |
+| Tokyo | TCP 443 | fapi.binance.com, ws-fapi.binance.com |
+| Tokyo | TCP 9443 | fstream.binance.com |
+| обе | TCP 22 | SSH (только ваш IP) |
+| обе | TCP 6379 | Redis (только 127.0.0.1) |
+
+## 📦 Полный деплой на сервер
+
+### 0. Что понадобится
+
+- Ubuntu 20.04 / 22.04 / 24.04 (amd64), пользователь с `sudo`.
+- Доступ к репозиторию `github.com/dimamalakhov/inside-bot`.
+- **Для Токио:** API-ключи Binance (группы `founders`/`friends`/`clients`, плюс один
+  `support` — с него `price_streamer` читает цены и плечи).
+- **Для Европы:** `api_id` / `api_hash` с [my.telegram.org](https://my.telegram.org)
+  (API development tools) и ID целевого чата.
+
+### 1. Как перенести код на сервер
+
+> Все команды — от обычного пользователя; `sudo` только там, где он есть.
+
+**Вариант A — `git clone` (основной путь).**
+
+```bash
+sudo apt update && sudo apt install -y git
+sudo mkdir -p /opt/rocket && sudo chown "$USER":"$USER" /opt/rocket
+git clone https://github.com/dimamalakhov/inside-bot.git /opt/rocket
+cd /opt/rocket
+```
+
+Если репозиторий сделают **приватным** — два способа:
+
+```bash
+# 1) SSH-ключ сервера: добавьте ~/.ssh/id_ed25519.pub в
+#    GitHub -> Settings -> SSH and GPG keys
+git clone git@github.com:dimamalakhov/inside-bot.git /opt/rocket
+
+# 2) Personal Access Token (быстро; токен окажется в .git/config)
+git clone https://<TOKEN>@github.com/dimamalakhov/inside-bot.git /opt/rocket
+```
+
+**Вариант B — архив с GitHub (git на сервере не нужен).**
+
+```bash
+sudo mkdir -p /opt/rocket && sudo chown "$USER":"$USER" /opt/rocket
+curl -L https://github.com/dimamalakhov/inside-bot/archive/refs/heads/main.tar.gz \
+  | tar -xz -C /opt/rocket --strip-components=1
+```
+
+**Вариант C — залить со своей машины** (сервер без доступа в интернет).
+
+```bash
+# из корня проекта на локальной машине
+rsync -av --exclude .git --exclude engine_rust/target --exclude venv \
+  ./ user@SERVER:/opt/rocket/
+
+# или архивом
+tar --exclude=.git --exclude=engine_rust/target -czf rocket.tar.gz .
+scp rocket.tar.gz user@SERVER:/tmp/
+ssh user@SERVER 'sudo mkdir -p /opt/rocket && sudo chown "$USER":"$USER" /opt/rocket \
+  && tar -xzf /tmp/rocket.tar.gz -C /opt/rocket'
+```
+
+Перенос готовых Telegram-сессий (если они уже есть на локальной машине):
+
+```bash
+scp sessions/listener_*.session user@SERVER:/opt/rocket/sessions/
+```
+
+**Чего в репозитории нет** (создаётся на сервере, потому что это секреты):
+
+| Файл | Как создать |
+|---|---|
+| `.env` (Токио) | `cp deploy/.env.example .env` |
+| `.env` (Европа) | `cp deploy/.env.listener.example .env` |
+| `config/api_keys.json` | `cp config/api_keys.example.json config/api_keys.json` |
+| `sessions/*.session` | `venv/bin/python3 generate_session.py` на сервере либо `scp` |
+
+### 2. Топология «одна машина»
+
+Всё на одном сервере: слушатель кладёт сигнал в локальный Redis, движок его забирает.
+
+```bash
+# 1) код
+git clone https://github.com/dimamalakhov/inside-bot.git /opt/rocket && cd /opt/rocket
+
+# 2) конфиги
+cp deploy/.env.example .env
+cp config/api_keys.example.json config/api_keys.json
+nano .env                     # TRADE_ALLOCATION, TP_PERCENT, SL_PERCENT, REDIS_*
+nano config/api_keys.json     # ключи аккаунтов + support
+
+# 3) установка: пакеты, Rust, сборка движка, venv, systemd-юниты
+sudo bash deploy/install.sh
+
+# 4) зависимости слушателя (на этой же машине)
+sudo venv/bin/pip install -r requirements_listener.txt
+
+# 5) Telegram-сессия (интерактивный вход: номер + код)
+sudo venv/bin/python3 generate_session.py
+
+# 6) юнит слушателя
+sed -e "s|__APP_DIR__|/opt/rocket|g" -e "s|__RUN_USER__|$USER|g" \
+  deploy/telegram_listener.service | sudo tee /etc/systemd/system/telegram_listener.service >/dev/null
+sudo systemctl daemon-reload
+sudo systemctl enable --now telegram_listener
+
+# 7) запуск торговой части (порядок важен)
+sudo systemctl enable --now redis-server price_streamer balance_streamer
+sleep 20                                   # ждём наполнения futures_tickers и балансов
+sudo systemctl start reset_account_config  # плечи и ISOLATED-маржа
+sudo systemctl start rust_trader
+```
+
+`BRIDGE_HOST` в `.env` оставьте пустым — UDP на этой топологии не нужен.
+
+### 3. Топология «гео-сплит» (Европа + Токио)
+
+#### 3.1 Европа — Listener Node
+
+Rust здесь не нужен: только Python, Redis и сессии Telegram.
+
+```bash
+# 1) код
+git clone https://github.com/dimamalakhov/inside-bot.git /opt/rocket && cd /opt/rocket
+
+# 2) пакеты и окружение
+sudo apt update
+sudo apt install -y python3 python3-venv redis-server
+python3 -m venv venv
+venv/bin/pip install -r requirements_listener.txt
+
+# 3) конфигурация
+cp deploy/.env.listener.example .env
+nano .env            # PYROGRAM_API_ID / API_HASH / TARGET_CHAT,
+                     # BRIDGE_HOST=<публичный IP Токио>, BRIDGE_PORT=5005
+
+# 4) Redis
+sudo systemctl enable --now redis-server
+
+# 5) сессии Telegram: либо сгенерировать на месте...
+venv/bin/python3 generate_session.py
+# ...либо перенести готовые (тогда шаг 5 пропускается):
+#   scp sessions/listener_*.session user@EU:/opt/rocket/sessions/
+
+# 6) systemd-юнит
+sed -e "s|__APP_DIR__|/opt/rocket|g" -e "s|__RUN_USER__|$USER|g" \
+  deploy/telegram_listener.service | sudo tee /etc/systemd/system/telegram_listener.service >/dev/null
+sudo systemctl daemon-reload
+sudo systemctl enable --now telegram_listener
+
+# 7) firewall
+sudo ufw allow OpenSSH
+sudo ufw enable
+```
+
+Если `BRIDGE_HOST` задан, каждый сигнал уходит в Токио по UDP (3 копии подряд, как
+в `bridge_client.py`). Без него сигналы останутся только в локальном Redis.
+
+#### 3.2 Токио — Trading Node
+
+```bash
+# 1) код
+git clone https://github.com/dimamalakhov/inside-bot.git /opt/rocket && cd /opt/rocket
+
+# 2) конфиги
+cp deploy/.env.example .env
+cp config/api_keys.example.json config/api_keys.json
+nano .env                     # REDIS_*, TRADE_DRY_RUN=true, TP/SL
+nano config/api_keys.json     # founders / friends / clients / support
+
+# 3) установка: пакеты, Rust, сборка, venv, systemd
+sudo bash deploy/install.sh
+
+# 4) запуск (порядок важен)
+sudo systemctl enable --now redis-server price_streamer balance_streamer
+sleep 20                                   # ждём futures_tickers и балансы
+sudo systemctl start reset_account_config
+sudo systemctl start rust_trader
+
+# 5) firewall
+sudo ufw allow OpenSSH
+sudo ufw allow from <IP_ЕВРОПЫ> to any port 5005 proto udp
+sudo ufw enable
+```
+
+#### 3.3 Проверка связки
+
+```bash
+# на Токио: движок слушает UDP и готов
+sudo journalctl -u rust_trader -n 50 --no-pager
+#   ожидаем "UDP bridge listening" и "engine fully operational"
+
+# на Европе: тестовый сигнал (без Telegram)
+venv/bin/python3 bridge_client.py BTCUSDT BUY --ip <IP_ТОКИО>
+# на Токио в логе: "udp signal" и далее обработка сигнала
+```
+
+### 4. Первый запуск: dry-run → прод
+
+`deploy/.env.example` уже содержит `TRADE_DRY_RUN=true` — движок считает размер
+позиции и TP/SL, логирует их, но **не отправляет ордера**.
+
+```bash
+# на Токио
+sudo journalctl -u rust_trader -f
+```
+
+Что должно быть в логе:
+- `heartbeat` раз в минуту со счётчиками;
+- при сигнале — `[dry-run] market order suppressed` с `qty`, `price`, `notional_usdt`.
+
+Убедились, что объёмы и TP/SL адекватны — переключаемся в прод:
+
+```bash
+sed -i 's/^TRADE_DRY_RUN=.*/TRADE_DRY_RUN=false/' .env
+sudo systemctl restart rust_trader
+```
+
+### 5. Обновление кода на сервере
+
+```bash
+cd /opt/rocket
+git pull
+sudo bash deploy/install.sh                      # пересборка + обновление юнитов
+sudo systemctl restart rust_trader price_streamer balance_streamer reset_account_config
+# на узле-слушателе:
+sudo systemctl restart telegram_listener
+```
+
+Если деплой был из архива (без git) — повторите «Вариант B» из шага 1.
+
+### 6. Диагностика
+
+```bash
+# состояние сервисов
+systemctl status rust_trader price_streamer balance_streamer reset_account_config
+systemctl status telegram_listener          # на Европе
+
+# логи
+journalctl -u rust_trader -f
+journalctl -u price_streamer -n 100 --no-pager
+
+# офлайн-самопроверка бинарника (не требует сети)
+/opt/rocket/engine_rust/target/release/rust_trader --selftest
+
+# что видит движок в Redis
+redis-cli hlen futures_tickers        # цены (должно быть > 0)
+redis-cli hget futures_tickers BTCUSDT
+redis-cli get balance:<owner>         # баланс аккаунта
+redis-cli llen trade_queue            # очередь сигналов
+```
+
+Частые причины «не торгует»:
+
+| Симптом | Причина |
+|---|---|
+| `no ticker data` | `price_streamer` не запущен / нет `support` ключа |
+| `zero balance` | `balance_streamer` не запущен / нет ключей в `api_keys.json` |
+| `symbol is not in exchangeInfo` | опечатка в символе сигнала |
+| `order rejected` | нет прав на фьючерсы, неверный ключ, нет средств |
+| `TP/SL ... naked position risk` | ордера TP/SL отклонены (проверьте `reduceOnly`/режим позиции) |
+
+### 7. Чек-лист
+
+- [ ] `git clone` в `/opt/rocket` (или архив/rsync)
+- [ ] `.env` создан из шаблона и заполнен
+- [ ] `config/api_keys.json` создан из примера и заполнен
+- [ ] сессии Telegram есть в `sessions/` (только для Европы)
+- [ ] `sudo bash deploy/install.sh` завершился, `--selftest` проходит
+- [ ] `redis-server`, `price_streamer`, `balance_streamer` — active
+- [ ] `reset_account_config` запущен **после** наполнения `futures_tickers`
+- [ ] `rust_trader` — active, в логе `engine fully operational`
+- [ ] UDP 5005 открыт между нодами (для гео-сплита)
+- [ ] старт в `TRADE_DRY_RUN=true`, проверены объёмы, затем `false`
 
 ## 🦀 Rust-движок: как он устроен
 
@@ -194,6 +423,7 @@ UDP :5005 ───────────┘            │
 | `format!("{:x}", order_id)[..8]` | паника на коротком hex | идентификатор больше не режется |
 | Дубли аккаунтов по `owner` в `api_keys.json` | два клиента на один аккаунт | дедупликация по `owner` |
 | Нет graceful shutdown, нет метрик | «слепой» процесс | `ctrl-c`, heartbeat, счётчики |
+| Слушатель писал сигнал только в локальный Redis | в гео-сплите Токио не получал сигналы | опциональная отправка по UDP при заданном `BRIDGE_HOST` |
 
 ## ⚙️ Переменные окружения Rust-движка
 
@@ -228,39 +458,20 @@ UDP :5005 ───────────┘            │
 | `FILL_POLL_ATTEMPTS` / `FILL_POLL_INTERVAL_MS` | `10` / `150` | резервный поллинг исполнения |
 | `RUST_LOG` | `info` | уровень логов (`RUST_LOG=debug`) |
 
-## 🎮 Использование
+## 🎮 Локальный запуск (для разработки)
 
-### Сервер 1 (Listener EU)
 ```bash
-# 1) Запустить Redis (локально)
-redis-server
-
-# 2) Запустить слушателя, отправляющего в Bridge
-python3 telegram_listener.py
-# при необходимости раскомментировать вызов bridge_client в коде
-```
-
-### Сервер 2 (Trader Tokyo)
-```bash
-# 1) Запустить Redis
-redis-server
-
-# 2) Запустить стримеры
+redis-server &                       # локальный Redis
 python3 price_streamer.py &
 python3 balance_streamer.py &
 
-# 3) Запустить движок
-python3 launcher.py --mode rust   # минимальная задержка
+python3 launcher.py --mode rust      # движок (минимальная задержка)
 # альтернативы:
-# python3 launcher.py --mode python
-# python3 launcher.py --mode duel
+# python3 launcher.py --mode python  # Python-движок
+# python3 launcher.py --mode duel    # оба сразу
 ```
 
-На Ubuntu рекомендуется управление через systemd (`sudo bash deploy/install.sh`):
-юниты `rust_trader`, `price_streamer`, `balance_streamer` перезапускаются
-автоматически и стартуют при загрузке. Подробности — в `deploy/README.md`.
-
-### Проверка и отладка Rust-движка
+Проверка и отладка Rust-движка:
 
 ```bash
 cd engine_rust
@@ -288,13 +499,15 @@ TRADE_DRY_RUN=1 RUST_LOG=debug ./target/release/rust_trader
 | Скрипт | Нода | Зачем |
 |---|---|---|
 | `reset_account_config.py` | Trading (Токио) | каждые 6 часов выставляет плечо и `ISOLATED`-режим маржи по всем аккаунтам/символам. Движок считает объём по `ticker.leverage`, но само плечо на бирже не меняет — этот скрипт делает настройки заранее |
-| `generate_session.py` | Listener (Европа) | создаёт новую Telegram-сессию (`listener_1.session`) при первом подключении нового аккаунта Pyrogram |
+| `generate_session.py` | Listener (Европа) | создаёт Telegram-сессию `sessions/listener_1.session` (интерактивный вход) |
 
-Запуск `reset_account_config.py` — на Trading Node после того, как `price_streamer.py`
-уже наполнил `futures_tickers`:
+`reset_account_config` запускается отдельным юнитом **после** того, как
+`price_streamer` наполнил `futures_tickers`: если тикеров ещё нет, скрипт
+логирует ошибку и ждёт следующего цикла (6 часов).
 
 ```bash
-python3 reset_account_config.py   # работает фоном с циклом 6 часов
+sudo systemctl start reset_account_config     # вручную, если нужно сейчас
+python3 reset_account_config.py               # без systemd — цикл 6 часов
 ```
 
 ## ⚠️ Важные замечания
@@ -307,5 +520,7 @@ python3 reset_account_config.py   # работает фоном с циклом 
 - TP/SL ставятся с `reduceOnly=true`, то есть корректны в **one-way mode**.
   Если на аккаунте включён **hedge mode**, нужен `positionSide` — это
   единственное место, где движок потребует доработки под ваш режим.
+- `.env`, `config/api_keys.json` и `sessions/*.session` — секреты, в репозитории
+  их нет. Если такой файл когда-либо попадёт в git — перевыпустите ключи.
 - `engine_rust/target/` и `venv/` — локальные артефакты сборки, создаются на
   сервере при `deploy/install.sh`, в git не нужны (см. `.gitignore`).
