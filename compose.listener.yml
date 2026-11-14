@@ -1,0 +1,56 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--port", "${REDIS_PORT:-6379}"]
+    restart: unless-stopped
+    volumes:
+      - listener_redis_data:/data
+    networks: [inside]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "${REDIS_PORT:-6379}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+
+  listener:
+    build:
+      context: .
+      dockerfile: Dockerfile.listener
+    image: inside-bot-listener:local
+    init: true
+    restart: unless-stopped
+    user: "${APP_UID:-10001}:${APP_GID:-10001}"
+    env_file: [.env]
+    environment:
+      REDIS_HOST: redis
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./sessions:/app/sessions
+      - ./logs:/app/logs
+      - ./.env:/app/.env:ro
+    networks: [inside]
+    read_only: false
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  inside:
+    driver: bridge
+
+volumes:
+  listener_redis_data:
+    name: inside-bot-listener-redis-data

@@ -1,101 +1,86 @@
 #!/usr/bin/env bash
-# ============================================================
-# Rocket v2 — Ubuntu provisioning for the Trading Node (Tokyo)
-#
-# Устанавливает системные пакеты, Rust toolchain, собирает Rust-движок,
-# поднимает Python-окружение для стримеров и ставит systemd-юниты.
-#
-# Запускать:  sudo ./deploy/install.sh
-# Переменные: RUN_USER=<пользователь>  (по умолчанию root)
-# ============================================================
+# Первичная установка Docker и развёртывание узла на Ubuntu 22.04/24.04.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUN_USER="${RUN_USER:-root}"
-VENV="$APP_DIR/venv"
-BIN="$APP_DIR/engine_rust/target/release/rust_trader"
+[[ "$(id -u)" -eq 0 ]] || fail "запустите с sudo: sudo bash deploy/install.sh"
+[[ -n "${SUDO_UID:-}" && "$SUDO_UID" -ne 0 ]] || fail "запускайте sudo из обычной учётной записи — владельца проекта, чтобы контейнеры использовали её UID/GID"
+[[ -r /etc/os-release ]] || fail "не удалось определить операционную систему"
+# shellcheck disable=SC1091
+source /etc/os-release
+[[ "${ID:-}" == ubuntu && ("${VERSION_ID:-}" == 22.04 || "${VERSION_ID:-}" == 24.04) ]] || fail "поддерживаются Ubuntu 22.04 и 24.04"
 
-log()  { printf '\033[1;32m[rocket]\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m[rocket]\033[0m %s\n' "$*"; }
-die()  { printf '\033[1;31m[rocket]\033[0m %s\n' "$*" >&2; exit 1; }
-
-[[ "$(id -u)" -eq 0 ]] || die "run as root: sudo ./deploy/install.sh"
-[[ -f "$APP_DIR/config/api_keys.json" ]] || warn "missing config/api_keys.json - cp config/api_keys.example.json config/api_keys.json and fill it in"
-[[ -f "$APP_DIR/.env" ]] || warn "missing .env - copy deploy/.env.example to .env and edit it"
-
-# ---- 1. system packages ------------------------------------------------
-log "Installing system packages..."
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y --no-install-recommends \
-    build-essential pkg-config curl ca-certificates git \
-    python3 python3-venv python3-dev python3-pip \
-    redis-server libssl-dev libffi-dev
-
-# ---- 2. Rust toolchain -------------------------------------------------
-if command -v cargo >/dev/null 2>&1; then
-    log "Rust already installed: $(cargo --version)"
+if [[ -t 0 ]]; then
+    read -r -p "Роль узла (listener/trader): " selected_role
 else
-    log "Installing Rust (rustup, minimal profile)..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --profile minimal --default-toolchain stable
-    # shellcheck disable=SC1091
-    source "$HOME/.cargo/env"
+    selected_role="${NODE_ROLE:-}"
+fi
+[[ "$selected_role" == listener || "$selected_role" == trader ]] || fail "для запуска без диалога задайте NODE_ROLE=listener или NODE_ROLE=trader"
+resolve_role "$selected_role"
+if [[ -f "$APP_DIR/.node-role" && "$(<"$APP_DIR/.node-role")" != "$ROLE" ]]; then
+    fail "эта копия репозитория уже настроена как $(<"$APP_DIR/.node-role"); для другой роли используйте отдельную копию"
 fi
 
-# ---- 3. build the engine ------------------------------------------------
-log "Building Rust engine (release, locked)..."
-( cd "$APP_DIR/engine_rust" && cargo build --release --locked )
-[[ -x "$BIN" ]] || die "binary not found at $BIN"
+owner_uid="${SUDO_UID:-0}"
+owner_gid="${SUDO_GID:-0}"
+check_legacy_services
 
-log "Running offline self-test..."
-"$BIN" --selftest || die "self-test failed"
-
-# ---- 4. Python venv for streamers ---------------------------------------
-log "Setting up Python venv..."
-if [[ ! -x "$VENV/bin/python3" ]]; then
-    python3 -m venv "$VENV"
+if [[ ! -f "$APP_DIR/.env" ]]; then
+    install -o "$owner_uid" -g "$owner_gid" -m 600 "$APP_DIR/.env.$ROLE.example" "$APP_DIR/.env"
+    info "файл .env создан из .env.$ROLE.example; заполните его и запустите установщик повторно"
 fi
-"$VENV/bin/pip" install --upgrade pip wheel >/dev/null
-"$VENV/bin/pip" install -r "$APP_DIR/requirements_trader.txt"
+if [[ "$ROLE" == trader && ! -f "$APP_DIR/config/api_keys.json" ]]; then
+    install -o "$owner_uid" -g "$owner_gid" -m 600 "$APP_DIR/config/api_keys.example.json" "$APP_DIR/config/api_keys.json"
+    info "config/api_keys.json создан из примера; добавьте действительные ключи и запустите установщик повторно"
+fi
+[[ -d "$APP_DIR/sessions" ]] || install -d -o "$owner_uid" -g "$owner_gid" -m 700 "$APP_DIR/sessions"
+[[ -d "$APP_DIR/logs" ]] || install -d -o "$owner_uid" -g "$owner_gid" -m 750 "$APP_DIR/logs"
+if [[ ! -f "$APP_DIR/.node-role" ]]; then
+    printf '%s\n' "$ROLE" > "$APP_DIR/.node-role"
+    chown "$owner_uid:$owner_gid" "$APP_DIR/.node-role"
+    chmod 600 "$APP_DIR/.node-role"
+fi
+validate_config
+assert_dry_run
 
-# ---- 5. systemd units ----------------------------------------------------
-log "Installing systemd units (run user: $RUN_USER)..."
-for unit in rust_trader price_streamer balance_streamer reset_account_config; do
-    sed \
-        -e "s|__APP_DIR__|$APP_DIR|g" \
-        -e "s|__RUN_USER__|$RUN_USER|g" \
-        "$APP_DIR/deploy/$unit.service" > "/etc/systemd/system/$unit.service"
-    log "  -> /etc/systemd/system/$unit.service"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y ca-certificates curl gnupg
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
+chmod a+r /etc/apt/keyrings/docker.gpg
+arch="$(dpkg --print-architecture)"
+codename="${UBUNTU_CODENAME:-$VERSION_CODENAME}"
+printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu %s stable\n' "$arch" "$codename" > /etc/apt/sources.list.d/docker.list
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+systemctl enable --now docker
+docker info >/dev/null
+docker compose version
+
+export_compose_ids
+compose build
+if [[ "$ROLE" == trader ]]; then
+    compose run --rm --no-deps price-streamer python deploy/validate_api_keys.py config/api_keys.json
+fi
+compose config --quiet
+
+if [[ "$ROLE" == listener ]] && ! compgen -G "$APP_DIR/sessions/listener_*.session" >/dev/null; then
+    info "Telegram-сессия не найдена. Запускается интерактивное создание сессии через generate_session.py."
+    compose run --rm --no-deps listener python generate_session.py
+fi
+
+validate_config
+compose up -d
+
+for attempt in $(seq 1 30); do
+    if [[ "$ROLE" == listener ]]; then
+        if compose ps --status running --services | grep -qx listener && compose exec -T redis redis-cli ping | grep -qx PONG; then break; fi
+    else
+        if compose ps --status running --services | grep -qx rust-trader && compose exec -T redis redis-cli ping | grep -qx PONG; then break; fi
+    fi
+    [[ "$attempt" -lt 30 ]] || fail "контейнеры не перешли в состояние запуска; проверьте журналы командой deploy/logs.sh $ROLE"
+    sleep 2
 done
-
-systemctl daemon-reload
-systemctl enable --now redis-server
-systemctl enable rust_trader price_streamer balance_streamer reset_account_config
-
-# ---- 6. ownership (если юниты работают не от root) ----------------------
-if [[ "$RUN_USER" != "root" ]]; then
-    chown -R "$RUN_USER":"$RUN_USER" "$APP_DIR"
-    log "project ownership handed to $RUN_USER"
-fi
-
-cat <<'EOF'
-
-============================================================
-Готово. Осталось настроить и запустить:
-
-  1. config/api_keys.json  — ключи аккаунтов (founders/friends/clients)
-  2. .env                  — cp deploy/.env.example .env  (TRADE_DRY_RUN=true для первого старта)
-  3. systemctl start price_streamer balance_streamer
-     sleep 15
-     systemctl start reset_account_config rust_trader
-
-Проверка:
-  systemctl status rust_trader
-  journalctl -u rust_trader -f
-  journalctl -u price_streamer -f
-
-Когда dry-run пройден — поставьте TRADE_DRY_RUN=false, перезапустите движок:
-  systemctl restart rust_trader
-============================================================
-EOF
+compose ps
+info "установка роли $ROLE завершена. Для торгового узла требовалось TRADE_DRY_RUN=true."

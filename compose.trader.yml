@@ -1,0 +1,120 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--port", "${REDIS_PORT:-6379}"]
+    restart: unless-stopped
+    volumes:
+      - trader_redis_data:/data
+    networks: [inside]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "${REDIS_PORT:-6379}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+
+  price-streamer:
+    build:
+      context: .
+      dockerfile: Dockerfile.trader
+    image: inside-bot-trader:local
+    command: ["python", "price_streamer.py"]
+    init: true
+    restart: unless-stopped
+    user: "${APP_UID:-10001}:${APP_GID:-10001}"
+    env_file: [.env]
+    environment: {REDIS_HOST: redis}
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./config/api_keys.json:/app/config/api_keys.json:ro
+      - ./.env:/app/.env:ro
+      - ./logs:/logs
+    networks: [inside]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    logging: &app_logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  balance-streamer:
+    image: inside-bot-trader:local
+    command: ["python", "balance_streamer.py"]
+    init: true
+    restart: unless-stopped
+    user: "${APP_UID:-10001}:${APP_GID:-10001}"
+    env_file: [.env]
+    environment: {REDIS_HOST: redis}
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./config/api_keys.json:/app/config/api_keys.json:ro
+      - ./.env:/app/.env:ro
+      - ./logs:/logs
+    networks: [inside]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    logging: *app_logging
+
+  rust-trader:
+    image: inside-bot-trader:local
+    command: ["/usr/local/bin/rust_trader"]
+    init: true
+    restart: unless-stopped
+    user: "${APP_UID:-10001}:${APP_GID:-10001}"
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    env_file: [.env]
+    environment: {REDIS_HOST: redis, TRADE_DRY_RUN: "${TRADE_DRY_RUN:-true}"}
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./config/api_keys.json:/app/config/api_keys.json:ro
+      - ./.env:/app/.env:ro
+    networks: [inside]
+    ports:
+      - "${BRIDGE_PORT:-5005}:${BRIDGE_PORT:-5005}/udp"
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    logging: *app_logging
+
+  account-config-reset:
+    image: inside-bot-trader:local
+    command: ["python", "reset_account_config.py"]
+    init: true
+    profiles: ["account-setup"]
+    restart: unless-stopped
+    user: "${APP_UID:-10001}:${APP_GID:-10001}"
+    env_file: [.env]
+    environment: {REDIS_HOST: redis}
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./config/api_keys.json:/app/config/api_keys.json:ro
+      - ./.env:/app/.env:ro
+    networks: [inside]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    logging: *app_logging
+
+networks:
+  inside:
+    driver: bridge
+
+volumes:
+  trader_redis_data:
+    name: inside-bot-trader-redis-data

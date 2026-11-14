@@ -1,0 +1,33 @@
+FROM rust:1-bookworm AS rust-build
+WORKDIR /src
+COPY engine_rust/Cargo.toml engine_rust/Cargo.lock ./engine_rust/
+COPY engine_rust/src ./engine_rust/src
+WORKDIR /src/engine_rust
+RUN cargo build --release --locked
+
+FROM python:3.11-slim-bookworm AS python-dependencies
+ENV VIRTUAL_ENV=/opt/venv
+RUN python -m venv "$VIRTUAL_ENV" \
+    && "$VIRTUAL_ENV/bin/pip" install --no-cache-dir --upgrade pip
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+WORKDIR /app
+COPY requirements_trader.txt ./
+RUN pip install --no-cache-dir -r requirements_trader.txt
+
+FROM python:3.11-slim-bookworm AS runtime
+ENV VIRTUAL_ENV=/opt/venv PATH="/opt/venv/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 app \
+    && useradd --system --uid 10001 --gid app --home-dir /app --no-create-home app \
+    && mkdir -p /app/config /app/logs /logs \
+    && chown -R app:app /app /logs
+WORKDIR /app
+COPY --from=python-dependencies /opt/venv /opt/venv
+COPY --from=rust-build /src/engine_rust/target/release/rust_trader /usr/local/bin/rust_trader
+COPY --chown=app:app engine_python.py price_streamer.py balance_streamer.py reset_account_config.py bridge_client.py launcher.py ./
+COPY --chown=app:app utils ./utils
+COPY --chown=app:app deploy/validate_api_keys.py ./deploy/validate_api_keys.py
+USER app
+CMD ["/usr/local/bin/rust_trader"]

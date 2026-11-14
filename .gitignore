@@ -11,9 +11,12 @@ venv/
 
 # логи и сессии
 logs/
+backups/
 *.session
 *.session-journal
 
 # прочее
+.vscode/
 .env
+.node-role
 config/api_keys.json
