@@ -97,51 +97,6 @@
 - **Для Европы:** `api_id` / `api_hash` с [my.telegram.org](https://my.telegram.org)
   (API development tools) и ID целевого чата.
 
-### 1. Как перенести код на сервер
-
-> Все команды — от обычного пользователя; `sudo` только там, где он есть.
-
-**Вариант A — `git clone` (основной путь).**
-
-```bash
-sudo apt update && sudo apt install -y git
-sudo mkdir -p /opt/rocket && sudo chown "$USER":"$USER" /opt/rocket
-git clone https://github.com/dimamalakhov/inside-bot.git /opt/rocket
-cd /opt/rocket
-```
-
-Если репозиторий сделают **приватным** — два способа:
-
-```bash
-# 1) SSH-ключ сервера: добавьте ~/.ssh/id_ed25519.pub в
-#    GitHub -> Settings -> SSH and GPG keys
-git clone git@github.com:dimamalakhov/inside-bot.git /opt/rocket
-
-# 2) Personal Access Token (быстро; токен окажется в .git/config)
-git clone https://<TOKEN>@github.com/dimamalakhov/inside-bot.git /opt/rocket
-```
-
-**Вариант B — архив с GitHub (git на сервере не нужен).**
-
-```bash
-sudo mkdir -p /opt/rocket && sudo chown "$USER":"$USER" /opt/rocket
-curl -L https://github.com/dimamalakhov/inside-bot/archive/refs/heads/main.tar.gz \
-  | tar -xz -C /opt/rocket --strip-components=1
-```
-
-**Вариант C — залить со своей машины** (сервер без доступа в интернет).
-
-```bash
-# из корня проекта на локальной машине
-rsync -av --exclude .git --exclude engine_rust/target --exclude venv \
-  ./ user@SERVER:/opt/rocket/
-
-# или архивом
-tar --exclude=.git --exclude=engine_rust/target -czf rocket.tar.gz .
-scp rocket.tar.gz user@SERVER:/tmp/
-ssh user@SERVER 'sudo mkdir -p /opt/rocket && sudo chown "$USER":"$USER" /opt/rocket \
-  && tar -xzf /tmp/rocket.tar.gz -C /opt/rocket'
-```
 
 Перенос готовых Telegram-сессий (если они уже есть на локальной машине):
 
@@ -157,44 +112,6 @@ scp sessions/listener_*.session user@SERVER:/opt/rocket/sessions/
 | `.env` (Европа) | `cp deploy/.env.listener.example .env` |
 | `config/api_keys.json` | `cp config/api_keys.example.json config/api_keys.json` |
 | `sessions/*.session` | `venv/bin/python3 generate_session.py` на сервере либо `scp` |
-
-### 2. Топология «одна машина»
-
-Всё на одном сервере: слушатель кладёт сигнал в локальный Redis, движок его забирает.
-
-```bash
-# 1) код
-git clone https://github.com/dimamalakhov/inside-bot.git /opt/rocket && cd /opt/rocket
-
-# 2) конфиги
-cp deploy/.env.example .env
-cp config/api_keys.example.json config/api_keys.json
-nano .env                     # TRADE_ALLOCATION, TP_PERCENT, SL_PERCENT, REDIS_*
-nano config/api_keys.json     # ключи аккаунтов + support
-
-# 3) установка: пакеты, Rust, сборка движка, venv, systemd-юниты
-sudo bash deploy/install.sh
-
-# 4) зависимости слушателя (на этой же машине)
-sudo venv/bin/pip install -r requirements_listener.txt
-
-# 5) Telegram-сессия (интерактивный вход: номер + код)
-sudo venv/bin/python3 generate_session.py
-
-# 6) юнит слушателя
-sed -e "s|__APP_DIR__|/opt/rocket|g" -e "s|__RUN_USER__|$USER|g" \
-  deploy/telegram_listener.service | sudo tee /etc/systemd/system/telegram_listener.service >/dev/null
-sudo systemctl daemon-reload
-sudo systemctl enable --now telegram_listener
-
-# 7) запуск торговой части (порядок важен)
-sudo systemctl enable --now redis-server price_streamer balance_streamer
-sleep 20                                   # ждём наполнения futures_tickers и балансов
-sudo systemctl start reset_account_config  # плечи и ISOLATED-маржа
-sudo systemctl start rust_trader
-```
-
-`BRIDGE_HOST` в `.env` оставьте пустым — UDP на этой топологии не нужен.
 
 ### 3. Топология «гео-сплит» (Европа + Токио)
 
@@ -310,8 +227,6 @@ sudo systemctl restart rust_trader price_streamer balance_streamer reset_account
 sudo systemctl restart telegram_listener
 ```
 
-Если деплой был из архива (без git) — повторите «Вариант B» из шага 1.
-
 ### 6. Диагностика
 
 ```bash
@@ -332,29 +247,6 @@ redis-cli hget futures_tickers BTCUSDT
 redis-cli get balance:<owner>         # баланс аккаунта
 redis-cli llen trade_queue            # очередь сигналов
 ```
-
-Частые причины «не торгует»:
-
-| Симптом | Причина |
-|---|---|
-| `no ticker data` | `price_streamer` не запущен / нет `support` ключа |
-| `zero balance` | `balance_streamer` не запущен / нет ключей в `api_keys.json` |
-| `symbol is not in exchangeInfo` | опечатка в символе сигнала |
-| `order rejected` | нет прав на фьючерсы, неверный ключ, нет средств |
-| `TP/SL ... naked position risk` | ордера TP/SL отклонены (проверьте `reduceOnly`/режим позиции) |
-
-### 7. Чек-лист
-
-- [ ] `git clone` в `/opt/rocket` (или архив/rsync)
-- [ ] `.env` создан из шаблона и заполнен
-- [ ] `config/api_keys.json` создан из примера и заполнен
-- [ ] сессии Telegram есть в `sessions/` (только для Европы)
-- [ ] `sudo bash deploy/install.sh` завершился, `--selftest` проходит
-- [ ] `redis-server`, `price_streamer`, `balance_streamer` — active
-- [ ] `reset_account_config` запущен **после** наполнения `futures_tickers`
-- [ ] `rust_trader` — active, в логе `engine fully operational`
-- [ ] UDP 5005 открыт между нодами (для гео-сплита)
-- [ ] старт в `TRADE_DRY_RUN=true`, проверены объёмы, затем `false`
 
 ## 🦀 Rust-движок: как он устроен
 
